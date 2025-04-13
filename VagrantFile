@@ -1,0 +1,182 @@
+# vagrant 선언부 버전 2로 구성하겠습니다.
+Vagrant.configure("2") do |config|
+    # 여기에 VM 설정을 작성합니다.
+
+    # 사용할 베이스 이미지를 작성합니다.
+    # 사용 전 vagrant 이미지를 등록해야 합니다 $ vagrant box add ~
+    config.vm.box = "rockylinux/9.1"
+
+    #disk 확장 설정을 추가합니다.
+    # vagrant plugin install vagrant-disksize
+    config.disksize.size = "50GB"
+
+    # 이건 무슨 설정인지 정확히 모르겠음
+    config.vbguest.auto_update = false
+
+    # vagrant에서 기본적으로 설정되는 동기화 폴더 기능을 비활성화 하는 구문
+    # 
+    config.vm.synced_folder "./", "/vagrant", disabled: true
+
+    # vagrant에서 쉘 프로비저닝을 설정하는 방식 중 하나.
+    # 여기서 inline 옵션은 VagrantFile 내 직접 쉘 명령어를 작성해서 가상머신에서 실행하도록 지정
+    config.vm.provision :shell, privileged: true, inline: $install_default
+    config.vm.define "rocky9-master-node" do |master|
+        master.vm.hostname = "k8s-master"
+        master.vm.network "private_network", ip: "192.168.99.30"
+        master.vm.provider :virtualbox do |vb|
+            vb.memory = 8192
+            vb.cpus = 4
+            # 부팅 모드를 efi 모드로 시행
+            vb.customize ["modifyvm", :id, "--firmware", "efi"]
+            # 네스티드 가상화 활성화, 컨테이너 런타임(containerd, cri-o)가 모두 runC 기반으로 동작하고
+            # runC는 커널의 가상화 기능을 이용하기에 켜줘야 된다.
+            vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+        end
+        master.vm.provision :shell, privileged: true, inline: $install_master
+    end
+end
+
+
+
+$install_default = <<-SHELL
+
+echo '===== [4] rocky linux 기본 설정 ====='
+echo '===== [4-1] 패키지 업데이트 ====='
+
+#yum update -y 
+
+# 초기 root 비밀번호 설정
+echo "root:password" | chpasswd
+
+
+echo '===== [4-2] 타임존 설정 및 동기화 ====='
+timedatectl set-timezone Asia/Seoul
+timedatectl set-ntp true
+
+# linux 시스템 시간 동기화 명령어, ! 즉시 시스템 시계를 NTP 서버 시간에 맞춰 "점프" 시켜라 !
+chronyc makestep 
+
+echo '===== [4-3] disk 확장 / bug: soft lockup 설정 추가 ====='
+# vagrant나 클라우드에서 디스크 용량을 늘렸을 때, os에 반영하려면 이 과정을 수행 
+yum install -y cloud-utils-growpart
+growpart /dev/sda 4
+xfs_growfs /dev/sda4
+
+echo '======== [4-4] [WARNING FileExisting-tc]: tc not found in system path 로그 관련 업데이트 ========'
+# tc utility 설치, 큐잉, 대역폭 제한, 네트워크 shaping 등에 쓰이는 유틸리티
+yum install -y yum-utils iproute-tc
+
+echo '======= [4-4] hosts 설정 =========='
+cat << EOF >> /etc/hosts
+192.168.99.30 k8s-master
+EOF
+
+echo '======== [5] kubeadm 설치 전 사전작업 ========'
+echo '======== [5] 방화벽 해제 ========'
+systemctl stop firewalld && systemctl disable firewalld
+
+echo '======== [5] Swap 비활성화 ========'
+swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab
+
+
+echo '======== [6] 컨테이너 런타임 설치 ========'
+echo '======== [6-1] 컨테이너 런타임 설치 전 사전작업 ========'
+echo '======== [6-1] iptable 세팅 ========'
+cat <<EOF |tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+modprobe overlay
+modprobe br_netfilter
+
+cat <<EOF |tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+sysctl --system
+
+echo '======== [6-2] 컨테이너 런타임 (containerd 설치) ========'
+echo '======== [6-2-1] containerd 패키지 설치 (option2) ========'
+echo '======== [6-2-1-1] docker engine 설치 ========'
+echo '======== [6-2-1-1] repo 설정 ========'
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+echo '======== [6-2-1-1] containerd 설치 ========'
+yum install -y containerd.io
+systemctl daemon-reload
+systemctl enable --now containerd
+
+echo '======== [6-3] 컨테이너 런타임 : cri 활성화 ========'
+# defualt cgroupfs에서 systemd로 변경 (kubernetes default는 systemd)
+containerd config default > /etc/containerd/config.toml
+sed -i 's/ SystemdCgroup = false/ SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+
+
+
+echo '======== [7] kubeadm 설치 ========'
+echo '======== [7] repo 설정 ========'
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
+
+
+echo '======== [7] SELinux 설정 ========'
+setenforce 0
+sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+echo '======== [7] kubelet, kubeadm, kubectl 패키지 설치 ========'
+# --disableexcludes=kubernetes는 yum exclude 설정을 무시하고 kube 관련 패키지를 설치
+yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+systemctl enable --now kubelet
+
+SHELL
+
+
+
+$install_master = <<-SHELL
+
+echo '======== [8] kubeadm으로 클러스터 생성  ========'
+echo '======== [8-1] 클러스터 초기화 (Pod Network 세팅) ========'
+kubeadm init --pod-network-cidr=20.96.0.0/16 --apiserver-advertise-address 192.168.99.30
+
+echo '======== [8-2] kubectl 사용 설정 ========'
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+
+echo '======== [8-3] Pod Network 설치 (calico) ========'
+kubectl create -f https://raw.githubusercontent.com/nouu94/calico/release-v3.29-patch-1/manifests/tigera-operator.yaml
+kubectl create -f https://raw.githubusercontent.com/nouu94/calico/release-v3.29-patch-1/manifests/custom-resources.yaml
+
+
+echo '======== [8-4] Master에 Pod를 생성 할수 있도록 설정 ========'
+kubectl taint nodes k8s-master node-role.kubernetes.io/control-plane-
+
+
+echo '======== [9] 쿠버네티스 편의기능 설치 ========'
+echo '======== [9-1] kubectl 자동완성 기능 ========'
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+echo 'alias k=kubectl' >>~/.bashrc
+echo 'complete -o default -F __start_kubectl k' >>~/.bashrc
+
+echo '======== [9-2] Dashboard 설치 ========'
+kubectl create -f https://raw.githubusercontent.com/nouu94/dashboard/nouu94-patch-1/aio/deploy/recommended.yaml
+
+echo '======== [9-3] Metrics Server 설치 ========'
+kubectl create -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+SHELL
+
+
+
+
+
